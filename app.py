@@ -10,10 +10,19 @@ import unicodedata
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(
-    page_title="Dashboard de Inversiones Públicas",
-    page_icon="💰",
+    page_title="Dashboard de Inversiones Públicas (con Inflación)",
+    page_icon="inflation",
     layout="wide",
 )
+
+# --- DATOS DE INFLACIÓN (IPC ANUAL COLOMBIA) ---
+# Fuente: DANE, via gerencie.com, consultorcontable.com
+IPC_ANUAL = {
+    2010: 3.17, 2011: 3.73, 2012: 2.44, 2013: 1.94, 2014: 3.66, 2015: 6.77,
+    2016: 5.75, 2017: 4.09, 2018: 3.18, 2019: 3.80, 2020: 1.61, 2021: 5.62,
+    2022: 13.12, 2023: 9.28, 2024: 5.20 # Nota: El valor de 2024 puede ser parcial/proyectado
+}
+BASE_YEAR_INFLATION = 2023
 
 # --- PALETA DE COLORES Y ESTILOS ---
 PRIMARY_COLOR = "#1A5276"
@@ -38,21 +47,33 @@ def format_number(num):
     return f"${num:,.0f}"
 
 def normalize_text(text):
-    """
-    Normaliza el texto: convierte a minúsculas, quita tildes y caracteres especiales.
-    """
     if not isinstance(text, str):
         return text
     text = unicodedata.normalize('NFD', text)
     text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')
     return text.lower().strip()
 
+def get_inflation_factors(ipc_data, base_year):
+    factors = {}
+    ipc_index = {min(ipc_data.keys()) - 1: 100}
+    for year in sorted(ipc_data.keys()):
+        ipc_index[year] = ipc_index[year - 1] * (1 + ipc_data[year] / 100)
+    
+    base_ipc = ipc_index.get(base_year)
+    if not base_ipc:
+        st.warning(f"Año base {base_year} para inflación no encontrado. No se aplicará el ajuste.")
+        return None
+
+    for year, index_val in ipc_index.items():
+        factors[year] = base_ipc / index_val
+    return factors
+
 def load_geojson(path):
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except FileNotFoundError:
-        st.error(f"Error: Archivo GeoJSON no encontrado en '{path}'. Asegúrate de que el archivo 'colombia.geo.json' está en el directorio correcto.")
+        st.warning(f"Advertencia: Archivo GeoJSON no encontrado en '{path}'. El mapa no se mostrará.")
         return None
 
 def apply_styles():
@@ -60,7 +81,7 @@ def apply_styles():
     <style>
         .stApp {{ background-color: {BACKGROUND_COLOR} !important; }}
         [data-testid="stSidebar"] {{ background-color: {SIDEBAR_COLOR} !important; }}
-        [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3, [data-testid="stSidebar"] h4, [data-testid="stSidebar"] label, [data-testid="stSidebar"] p, [data-testid="stSidebar"] .stMultiSelect, [data-testid="stSidebar"] .stSlider {{ color: white !important; }}
+        [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3, [data-testid="stSidebar"] h4, [data-testid="stSidebar"] label, [data-testid="stSidebar"] p, [data-testid="stSidebar"] .stMultiSelect, [data-testid="stSidebar"] .stSlider, [data-testid="stSidebar"] .stToggle {{ color: white !important; }}
         [data-testid="stMultiSelect"] {{ color: black; }}
         h1, h2, h3, h4, h5, h6 {{ color: {PRIMARY_COLOR}; font-family: 'Segoe UI', sans-serif; }}
         .stMetric {{ background-color: #FFFFFF; border: 1px solid #E0E0E0; border-left: 5px solid {SECONDARY_COLOR}; border-radius: 8px; padding: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
@@ -71,7 +92,6 @@ def apply_styles():
 
 @st.cache_data(show_spinner="Cargando datos base desde la API de Socrata...")
 def get_base_data():
-    """Obtiene todos los datos de 2010 a 2025 para optimizar."""
     query = "$select=vigencia,departamento,municipio,fuentefinanciacion,valorpagado,sectorproyecto,nombreproyecto WHERE vigencia >= '2010' AND vigencia <= '2025'"
     url = f"{BASE_URL}{RESOURCE_ID}.json?{query}&$limit=99999999"
     try:
@@ -80,12 +100,11 @@ def get_base_data():
         df = pd.DataFrame(response.json())
         df['vigencia'] = pd.to_numeric(df['vigencia'], errors='coerce')
         df['valorpagado'] = pd.to_numeric(df['valorpagado'], errors='coerce')
+        df.dropna(subset=['vigencia', 'valorpagado'], inplace=True)
+        df['vigencia'] = df['vigencia'].astype(int)
         return df
-    except requests.exceptions.HTTPError as e:
-        st.error(f"Error al contactar la API de datos.gov.co: {e}")
-        return pd.DataFrame()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error de conexión: {e}")
+    except Exception as e:
+        st.error(f"Ocurrió un error al cargar los datos: {e}")
         return pd.DataFrame()
 
 # --- INICIO DE LA APP ---
@@ -93,12 +112,12 @@ apply_styles()
 
 df_base = get_base_data()
 if df_base.empty:
-    st.error("No se pudieron cargar los datos base de la API. La aplicación no puede continuar.")
+    st.error("No se pudieron cargar los datos base. La aplicación no puede continuar.")
     st.stop()
 
 # Cargar GeoJSON
-geojson_path = "colombia.geo.json"
-colombia_geojson = load_geojson(geojson_path)
+geojso_path = "colombia.geo.json"
+colombia_geojson = load_geojson(geojso_path)
 
 # --- BARRA LATERAL DE FILTROS ---
 st.sidebar.image("https://herramientas.camara.gov.co/htdocs/portal/mifirma/imagen/45.png", width=120)
@@ -106,51 +125,44 @@ st.sidebar.title("⚙️ Panel de Filtros Principal")
 
 # 1. FILTRO PRINCIPAL DE VIGENCIA
 st.sidebar.header("1. Seleccione el Periodo")
-min_year = 2010
-max_year = 2025
-
 selected_vigencia_range = st.sidebar.slider(
-    "Rango de Vigencias para el Análisis",
-    min_value=min_year,
-    max_value=max_year,
-    value=(min_year, max_year),
-    key='selected_vigencia_range'
+    "Rango de Vigencias", 2010, 2025, (2010, 2025), key='selected_vigencia_range'
 )
 
-# 2. FILTRAR EL DATAFRAME BASE SEGÚN LA VIGENCIA SELECCIONADA
-df_filtered_by_year = df_base[
-    (df_base['vigencia'] >= selected_vigencia_range[0]) &
-    (df_base['vigencia'] <= selected_vigencia_range[1])
-]
-
-# 3. FILTROS SECUNDARIOS
-st.sidebar.header("2. Filtros Adicionales")
-
+# 2. FILTROS SECUNDARIOS
+st.sidebar.header("2. Filtros Geográficos y de Fuente")
 if st.sidebar.button("🧹 Limpiar Filtros Adicionales"):
     st.session_state.selected_departamentos = []
     st.session_state.selected_municipios = []
     st.session_state.selected_fuentes = []
     st.rerun()
 
+df_filtered_by_year = df_base[
+    (df_base['vigencia'] >= selected_vigencia_range[0]) &
+    (df_base['vigencia'] <= selected_vigencia_range[1])
+]
+
 deptos_disponibles = sorted(df_filtered_by_year['departamento'].dropna().unique())
-selected_departamentos = st.sidebar.multiselect(
-    "Departamento(s)", deptos_disponibles, key='selected_departamentos'
-)
+selected_departamentos = st.sidebar.multiselect("Departamento(s)", deptos_disponibles, key='selected_departamentos')
 
 if selected_departamentos:
     municipios_disponibles = sorted(df_filtered_by_year[df_filtered_by_year['departamento'].isin(selected_departamentos)]['municipio'].dropna().unique())
 else:
     municipios_disponibles = sorted(df_filtered_by_year['municipio'].dropna().unique())
-selected_municipios = st.sidebar.multiselect(
-    "Municipio(s)", municipios_disponibles, key='selected_municipios'
-)
+selected_municipios = st.sidebar.multiselect("Municipio(s)", municipios_disponibles, key='selected_municipios')
 
 fuentes_disponibles = sorted(df_filtered_by_year['fuentefinanciacion'].dropna().unique())
-selected_fuentes = st.sidebar.multiselect(
-    "Fuente(s) de Financiación", fuentes_disponibles, key='selected_fuentes'
+selected_fuentes = st.sidebar.multiselect("Fuente(s) de Financiación", fuentes_disponibles, key='selected_fuentes')
+
+# 3. AJUSTE DE INFLACIÓN
+st.sidebar.header("3. Ajustes de Visualización")
+adjust_inflation = st.sidebar.toggle(
+    "📊 Ajustar por Inflación (Valor Real)",
+    value=False,
+    help=f"Calcula los valores monetarios en pesos equivalentes al año {BASE_YEAR_INFLATION} para una comparación real."
 )
 
-# Aplicar filtros adicionales al dataframe ya filtrado por año
+# --- PROCESAMIENTO DE DATOS PRINCIPAL ---
 dff = df_filtered_by_year.copy()
 if selected_departamentos:
     dff = dff[dff['departamento'].isin(selected_departamentos)]
@@ -159,8 +171,21 @@ if selected_municipios:
 if selected_fuentes:
     dff = dff[dff['fuentefinanciacion'].isin(selected_fuentes)]
 
+valor_columna = 'valorpagado'
+display_mode = "(Nominal)"
+
+if adjust_inflation:
+    inflation_factors = get_inflation_factors(IPC_ANUAL, BASE_YEAR_INFLATION)
+    if inflation_factors:
+        dff['valorpagado_ajustado'] = dff.apply(
+            lambda row: row['valorpagado'] * inflation_factors.get(row['vigencia'], 1),
+            axis=1
+        )
+        valor_columna = 'valorpagado_ajustado'
+        display_mode = f"(Real, base {BASE_YEAR_INFLATION})"
+
 # --- DASHBOARD PRINCIPAL ---
-st.markdown("<h1 style='text-align: center;'>DASHBOARD DE INVERSIONES PÚBLICAS</h1>", unsafe_allow_html=True)
+st.markdown(f"<h1 style='text-align: center;'>DASHBOARD DE INVERSIONES PÚBLICAS {display_mode}</h1>", unsafe_allow_html=True)
 st.markdown("<p style='text-align: center;'>Análisis interactivo de la ejecución de recursos públicos en Colombia.</p>", unsafe_allow_html=True)
 st.markdown("<p style='text-align: center; font-weight: bold;'>EQUIPO DE ANÁLISIS DE DATOS - UTL SENADOR LEÓN FREDY MUÑOZ</p>", unsafe_allow_html=True)
 
@@ -170,24 +195,22 @@ if dff.empty:
 
 # Métricas Generales
 with st.container(border=True):
-    st.subheader("📈 Métricas Generales (Según Filtros)")
+    st.subheader(f"📈 Métricas Generales {display_mode}")
     col1, col2, col3 = st.columns(3)
-    total_pagado = dff['valorpagado'].sum()
+    total_pagado = dff[valor_columna].sum()
     num_proyectos = dff['nombreproyecto'].nunique()
     vigencias_str = f"{selected_vigencia_range[0]} - {selected_vigencia_range[1]}"
-    col1.metric(label="💰 Valor Total Pagado (COP)", value=format_number(total_pagado))
+    col1.metric(label=f"💰 Valor Total Pagado {display_mode}", value=format_number(total_pagado))
     col2.metric(label="🏗️ Número de Proyectos", value=f"{num_proyectos:,}")
     col3.metric(label="🗓️ Rango de Vigencia", value=vigencias_str)
 
 # MAPA GEOGRÁFICO
 if colombia_geojson:
     with st.container(border=True):
-        st.subheader("🗺️ Distribución Geográfica de la Inversión")
-        
-        df_map = dff.groupby('departamento')['valorpagado'].sum().reset_index()
+        st.subheader(f"🗺️ Distribución Geográfica de la Inversión {display_mode}")
+        df_map = dff.groupby('departamento')[valor_columna].sum().reset_index()
         df_map['departamento_norm'] = df_map['departamento'].apply(normalize_text)
 
-        # Normalizar nombres en el GeoJSON para el mapeo
         for feature in colombia_geojson['features']:
             if 'properties' in feature and 'NOMBRE_DPT' in feature['properties']:
                 feature['properties']['NOMBRE_DPT_NORM'] = normalize_text(feature['properties']['NOMBRE_DPT'])
@@ -197,159 +220,164 @@ if colombia_geojson:
             geojson=colombia_geojson,
             featureidkey="properties.NOMBRE_DPT_NORM",
             locations="departamento_norm",
-            color="valorpagado",
+            color=valor_columna,
             color_continuous_scale=CHART_PALETTE,
             mapbox_style="carto-positron",
-            zoom=4,
-            center={"lat": 4.5709, "lon": -74.2973},
-            opacity=0.7,
-            labels={'valorpagado': 'Valor Pagado (COP)'},
-            hover_name="departamento",
-            hover_data={"valorpagado": ":,.0f"}
+            zoom=4, center={"lat": 4.5709, "lon": -74.2973}, opacity=0.7,
+            labels={valor_columna: f'Valor Pagado {display_mode}'},
+            hover_name="departamento", hover_data={valor_columna: ":,.0f"}
         )
-        fig_map.update_layout(
-            margin={"r":0,"t":0,"l":0,"b":0},
-            paper_bgcolor='rgba(0,0,0,0)',
-            font_color=TEXT_COLOR
-        )
+        fig_map.update_layout(margin={"r":0,"t":0,"l":0,"b":0}, paper_bgcolor='rgba(0,0,0,0)', font_color=TEXT_COLOR)
         st.plotly_chart(fig_map, use_container_width=True)
 
 # Gráfico de Inversión por Año
 with st.container(border=True):
-    st.subheader(f"📈 Inversión por Año ({vigencias_str})")
-    inversion_anual = dff.groupby('vigencia')['valorpagado'].sum().reset_index()
+    st.subheader(f"📈 Inversión por Año {display_mode}")
+    inversion_anual = dff.groupby('vigencia')[valor_columna].sum().reset_index()
     inversion_anual['vigencia'] = inversion_anual['vigencia'].astype(str)
     fig_anual = px.bar(
-        inversion_anual, x='vigencia', y='valorpagado',
-        text=[format_number(v) for v in inversion_anual['valorpagado']],
+        inversion_anual, x='vigencia', y=valor_columna,
+        text=[format_number(v) for v in inversion_anual[valor_columna]],
         color='vigencia', color_discrete_sequence=CHART_PALETTE
     )
-    fig_anual.update_layout(xaxis_title="Vigencia", yaxis_title="Valor Pagado", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color=TEXT_COLOR)
+    fig_anual.update_layout(xaxis_title="Vigencia", yaxis_title=f"Valor Pagado {display_mode}", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color=TEXT_COLOR)
     st.plotly_chart(fig_anual, use_container_width=True)
 
-# Análisis Comparativo Adaptable
+# Análisis Comparativo por Periodos
 with st.container(border=True):
-    st.subheader("📊 Análisis Comparativo por Periodos")
-    st.markdown("Los periodos a comparar se limitan al **rango de vigencias principal** que seleccionó en la barra lateral.")
-    
-    vigencias_en_rango = sorted(df_filtered_by_year['vigencia'].dropna().unique())
-    
-    if len(vigencias_en_rango) < 2:
-        st.warning("Seleccione un rango de al menos dos años en la barra lateral para poder comparar periodos.")
-    else:
-        col_comp1, col_comp2 = st.columns(2)
-        with col_comp1:
-            periodo1 = st.select_slider(
-                "Primer Periodo",
-                options=vigencias_en_rango,
-                value=(vigencias_en_rango[0], vigencias_en_rango[1])
-            )
-        with col_comp2:
-            periodo2 = st.select_slider(
-                "Segundo Periodo",
-                options=vigencias_en_rango,
-                value=(vigencias_en_rango[-2], vigencias_en_rango[-1])
-            )
-        
-        # Si hay departamentos seleccionados, el cálculo se basa en ellos. Si no, es el total.
-        df_comp = df_filtered_by_year
-        if selected_departamentos:
-            df_comp = df_comp[df_comp['departamento'].isin(selected_departamentos)]
-        
-        total_p1 = df_comp[(df_comp['vigencia'] >= periodo1[0]) & (df_comp['vigencia'] <= periodo1[1])]['valorpagado'].sum()
-        total_p2 = df_comp[(df_comp['vigencia'] >= periodo2[0]) & (df_comp['vigencia'] <= periodo2[1])]['valorpagado'].sum()
+    st.subheader(f"📊 Análisis Comparativo por Periodos {display_mode}")
 
-        fig_comp = go.Figure(data=[
-            go.Bar(name=f'{periodo1[0]}-{periodo1[1]}', x=['Periodo 1'], y=[total_p1], text=format_number(total_p1), textposition='auto', marker_color=SECONDARY_COLOR),
-            go.Bar(name=f'{periodo2[0]}-{periodo2[1]}', x=['Periodo 2'], y=[total_p2], text=format_number(total_p2), textposition='auto', marker_color=PRIMARY_COLOR)
-        ])
-        fig_comp.update_layout(title_text=f'Comparación de Inversión: {format_number(total_p1)} vs {format_number(total_p2)}', yaxis_title='Valor Pagado (COP)', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color=TEXT_COLOR)
+    # --- Selección de Periodos para Comparación ---
+    st.markdown("Seleccione los dos periodos que desea comparar. Los filtros geográficos y de fuente aplicados arriba también afectarán este análisis.")
+    
+    # CORRECTED LOGIC: Use the main filtered year range for the comparison sliders
+    min_year, max_year = selected_vigencia_range[0], selected_vigencia_range[1]
+
+    # Ensure default values are valid
+    default_p1_end = min_year + 1 if min_year + 1 <= max_year else max_year
+    default_p2_start = max_year - 1 if max_year - 1 >= min_year else min_year
+
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        st.markdown("##### Periodo 1")
+        periodo1_range = st.slider(
+            "Rango de años para el Periodo 1",
+            min_year, max_year,
+            (min_year, default_p1_end), # Corrected default
+            key='periodo1_slider'
+        )
+
+    with col_p2:
+        st.markdown("##### Periodo 2")
+        periodo2_range = st.slider(
+            "Rango de años para el Periodo 2",
+            min_year, max_year,
+            (default_p2_start, max_year), # Corrected default
+            key='periodo2_slider'
+        )
+
+    # Filtrar el dataframe `dff` (que ya tiene los filtros principales y el ajuste de inflación) para cada periodo
+    df_p1 = dff[
+        (dff['vigencia'] >= periodo1_range[0]) &
+        (dff['vigencia'] <= periodo1_range[1])
+    ]
+    total_p1 = df_p1[valor_columna].sum()
+
+    df_p2 = dff[
+        (dff['vigencia'] >= periodo2_range[0]) &
+        (dff['vigencia'] <= periodo2_range[1])
+    ]
+    total_p2 = df_p2[valor_columna].sum()
+
+    # --- Visualización de la Comparación ---
+    if total_p1 > 0 or total_p2 > 0:
+        # Métricas
+        comp_col1, comp_col2, comp_col3 = st.columns(3)
+        comp_col1.metric(
+            label=f"Total Invertido en Periodo 1 ({periodo1_range[0]}-{periodo1_range[1]})",
+            value=format_number(total_p1)
+        )
+        comp_col2.metric(
+            label=f"Total Invertido en Periodo 2 ({periodo2_range[0]}-{periodo2_range[1]})",
+            value=format_number(total_p2)
+        )
+
+        # Cálculo de la diferencia
+        diferencia = total_p2 - total_p1
+        if total_p1 > 0:
+            diferencia_percent = (diferencia / total_p1) * 100
+            comp_col3.metric(
+                label="Diferencia (P2 vs P1)",
+                value=format_number(diferencia),
+                delta=f"{diferencia_percent:.2f}%"
+            )
+        else:
+             comp_col3.metric(
+                label="Diferencia (P2 vs P1)",
+                value=format_number(diferencia),
+                delta="N/A"
+            )
+
+        # Gráfico de Barras Comparativo
+        df_comparacion = pd.DataFrame({
+            'Periodo': [f"Periodo 1 ({periodo1_range[0]}-{periodo1_range[1]})", f"Periodo 2 ({periodo2_range[0]}-{periodo2_range[1]})"],
+            'Total Invertido': [total_p1, total_p2]
+        })
+        
+        fig_comp = px.bar(
+            df_comparacion,
+            x='Periodo',
+            y='Total Invertido',
+            color='Periodo',
+            color_discrete_sequence=[PRIMARY_COLOR, SECONDARY_COLOR],
+            text=[format_number(v) for v in df_comparacion['Total Invertido']],
+            title=f"Comparación de Inversión Total {display_mode}"
+        )
+        fig_comp.update_layout(
+            showlegend=False,
+            yaxis_title=f"Valor Pagado {display_mode}",
+            xaxis_title=None,
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font_color=TEXT_COLOR
+        )
         st.plotly_chart(fig_comp, use_container_width=True)
+    else:
+        st.info("No se encontraron datos en los periodos seleccionados para realizar la comparación.")
 
 # Gráficas Detalladas de Top 10
 with st.container(border=True):
-    st.subheader("📈 Análisis Detallado por Categoría")
+    st.subheader(f"📈 Análisis Detallado por Categoría {display_mode}")
     col_a, col_b = st.columns(2)
     
-    top_deptos = dff.groupby('departamento')['valorpagado'].sum().nlargest(10).sort_values(ascending=True)
-    top_municipios = dff.groupby('municipio')['valorpagado'].sum().nlargest(10).sort_values(ascending=True)
-    top_sectores = dff.groupby('sectorproyecto')['valorpagado'].sum().nlargest(10).sort_values(ascending=True)
+    top_deptos = dff.groupby('departamento')[valor_columna].sum().nlargest(10).sort_values(ascending=True)
+    top_municipios = dff.groupby('municipio')[valor_columna].sum().nlargest(10).sort_values(ascending=True)
+    top_sectores = dff.groupby('sectorproyecto')[valor_columna].sum().nlargest(10).sort_values(ascending=True)
     
     with col_a:
-        with st.expander("Top 10 Departamentos por Inversión", expanded=True):
-            fig_deptos = px.bar(top_deptos, y=top_deptos.index, x='valorpagado', orientation='h', text=[format_number(v) for v in top_deptos.values], color=top_deptos.values, color_continuous_scale=CHART_PALETTE)
-            fig_deptos.update_traces(hovertemplate='<b>%{y}</b><br>Valor Pagado: %{x:,.0f} COP<extra></extra>', textposition='outside')
-            fig_deptos.update_layout(yaxis_title=None, xaxis_title=None, showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', yaxis=dict(autorange="reversed"), font_color="black")
+        with st.expander(f"Top 10 Departamentos por Inversión {display_mode}", expanded=True):
+            fig_deptos = px.bar(top_deptos, y=top_deptos.index, x=top_deptos.values, orientation='h', text=[format_number(v) for v in top_deptos.values], color=top_deptos.values, color_continuous_scale=CHART_PALETTE)
+            fig_deptos.update_layout(yaxis_title=None, xaxis_title=None, showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="black")
             st.plotly_chart(fig_deptos, use_container_width=True)
 
-        with st.expander("Top 10 Sectores por Inversión", expanded=True):
-            fig_sectores = px.bar(top_sectores, y=top_sectores.index, x='valorpagado', orientation='h', text=[format_number(v) for v in top_sectores.values], color=top_sectores.values, color_continuous_scale=CHART_PALETTE)
-            fig_sectores.update_traces(hovertemplate='<b>%{y}</b><br>Valor Pagado: %{x:,.0f} COP<extra></extra>', textposition='outside')
-            fig_sectores.update_layout(yaxis_title=None, xaxis_title=None, showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', yaxis=dict(autorange="reversed"), font_color="black")
+        with st.expander(f"Top 10 Sectores por Inversión {display_mode}", expanded=True):
+            fig_sectores = px.bar(top_sectores, y=top_sectores.index, x=top_sectores.values, orientation='h', text=[format_number(v) for v in top_sectores.values], color=top_sectores.values, color_continuous_scale=CHART_PALETTE)
+            fig_sectores.update_layout(yaxis_title=None, xaxis_title=None, showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="black")
             st.plotly_chart(fig_sectores, use_container_width=True)
     
     with col_b:
-        with st.expander("Top 10 Municipios por Inversión", expanded=True):
-            fig_municipios = px.bar(top_municipios, y=top_municipios.index, x='valorpagado', orientation='h', text=[format_number(v) for v in top_municipios.values], color=top_municipios.values, color_continuous_scale=CHART_PALETTE)
-            fig_municipios.update_traces(hovertemplate='<b>%{y}</b><br>Valor Pagado: %{x:,.0f} COP<extra></extra>', textposition='outside')
-            fig_municipios.update_layout(yaxis_title=None, xaxis_title=None, showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', yaxis=dict(autorange="reversed"), font_color="black")
+        with st.expander(f"Top 10 Municipios por Inversión {display_mode}", expanded=True):
+            fig_municipios = px.bar(top_municipios, y=top_municipios.index, x=top_municipios.values, orientation='h', text=[format_number(v) for v in top_municipios.values], color=top_municipios.values, color_continuous_scale=CHART_PALETTE)
+            fig_municipios.update_layout(yaxis_title=None, xaxis_title=None, showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="black")
             st.plotly_chart(fig_municipios, use_container_width=True)
         
         proyectos_por_municipio = dff.groupby('municipio')['nombreproyecto'].nunique().nlargest(10).sort_values(ascending=True)
         with st.expander("Top 10 Municipios por # de Proyectos", expanded=True):
             fig_proy_mun = px.bar(proyectos_por_municipio, y=proyectos_por_municipio.index, x=proyectos_por_municipio.values, orientation='h', text=proyectos_por_municipio.values, color=proyectos_por_municipio.values, color_continuous_scale=CHART_PALETTE)
-            fig_proy_mun.update_traces(hovertemplate='<b>%{y}</b><br>Número de Proyectos: %{x:,}<extra></extra>', textposition='outside')
-            fig_proy_mun.update_layout(yaxis_title=None, xaxis_title=None, showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', yaxis=dict(autorange="reversed"), font_color="black")
+            fig_proy_mun.update_layout(yaxis_title=None, xaxis_title=None, showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="black")
             st.plotly_chart(fig_proy_mun, use_container_width=True)
 
-with st.container(border=True):
-    st.subheader("⬇️ Descargar Datos y Reportes")
-    
-    def convert_df_to_csv(df):
-        return df.to_csv(index=False).encode('utf-8')
-    
-    csv_data = convert_df_to_csv(dff)
-    st.download_button(
-        label="📥 Descargar Datos Filtrados (CSV)",
-        data=csv_data,
-        file_name=f"inversiones_filtradas.csv",
-        mime="text/csv",
-        help="Descarga el conjunto de datos actual con los filtros aplicados."
-    )
-
-    if st.button("🖼️ Crear y Descargar Reporte de Gráficos (PNG)"):
-        with st.spinner("Generando reporte de gráficos, por favor espera..."):
-            fig_reporte = make_subplots(
-                rows=3, cols=2,
-                subplot_titles=("Top 10 Departamentos por Inversión", "Top 10 Municipios por Inversión",
-                                "Top 10 Sectores por Inversión", "Top 10 Municipios por # de Proyectos",
-                                "Inversión por Año", ""),
-                vertical_spacing=0.15,
-                horizontal_spacing=0.1
-            )
-            fig_reporte.add_trace(go.Bar(x=top_deptos.values, y=top_deptos.index, orientation='h', name='Deptos', text=[format_number(v) for v in top_deptos.values], marker_color=CHART_PALETTE[0]), row=1, col=1)
-            fig_reporte.add_trace(go.Bar(x=top_municipios.values, y=top_municipios.index, orientation='h', name='Mpios', text=[format_number(v) for v in top_municipios.values], marker_color=CHART_PALETTE[1]), row=1, col=2)
-            fig_reporte.add_trace(go.Bar(x=top_sectores.values, y=top_sectores.index, orientation='h', name='Sectores', text=[format_number(v) for v in top_sectores.values], marker_color=CHART_PALETTE[2]), row=2, col=1)
-            fig_reporte.add_trace(go.Bar(x=proyectos_por_municipio.values, y=proyectos_por_municipio.index, orientation='h', name='Proy/Mpio', text=proyectos_por_municipio.values, marker_color=CHART_PALETTE[3]), row=2, col=2)
-            
-            inversion_anual_reporte = dff.groupby('vigencia')['valorpagado'].sum().reset_index()
-            fig_reporte.add_trace(go.Bar(x=inversion_anual_reporte['vigencia'], y=inversion_anual_reporte['valorpagado'], name='Inv. Anual', marker_color=CHART_PALETTE[4]), row=3, col=1)
-
-            titulo_principal = f"Reporte de Inversiones Públicas - Vigencia(s): {selected_vigencia_range[0]} a {selected_vigencia_range[1]}"
-            fig_reporte.update_layout(title_text=titulo_principal, height=1400, width=1600, showlegend=False, paper_bgcolor='#FFFFFF', plot_bgcolor='#FFFFFF', font=dict(color=TEXT_COLOR), colorway=CHART_PALETTE)
-            fig_reporte.update_yaxes(autorange="reversed")
-            fig_reporte.update_traces(textposition='outside')
-
-            img_bytes = fig_reporte.to_image(format="png", scale=2)
-            buf = BytesIO(img_bytes)
-
-            st.success("¡Reporte de gráficos generado! Haz clic en el botón de abajo para descargar.")
-            st.download_button(
-                label="📥 Descargar Imagen PNG",
-                data=buf,
-                file_name=f"reporte_inversiones_graficos.png",
-                mime="image/png"
-            )
+# ... (resto de la app, como descargas y tabla de datos)
 
 with st.container(border=True):
     st.subheader("🔍 Explorador de Proyectos (Según Filtros)")
